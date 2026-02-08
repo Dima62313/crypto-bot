@@ -21,7 +21,7 @@ TIMEFRAME_ENTRY = "5m"
 CHECK_INTERVAL = 60
 COOLDOWN = 3600
 MIN_STOP_PCT = 0.005   # 0.5%
-MIN_RR = 2.5
+MIN_RR = 3.0
 # =========================================
 
 bot = Bot(token=TOKEN)
@@ -43,8 +43,10 @@ def trend_tf(symbol):
 
 def find_fvg(df):
     for i in range(2, len(df)):
+        # Bullish FVG
         if df["low"].iloc[i] > df["high"].iloc[i-2]:
             return ("bull", df["high"].iloc[i-2], df["low"].iloc[i])
+        # Bearish FVG
         if df["high"].iloc[i] < df["low"].iloc[i-2]:
             return ("bear", df["low"].iloc[i-2], df["high"].iloc[i])
     return None
@@ -60,7 +62,7 @@ def calc_atr(df, period=14):
     ], axis=1).max(axis=1)
     return tr.rolling(period).mean().iloc[-1]
 
-# ================= SIGNAL LOGIC =================
+# ================= SIGNAL LOGIC (SMC) =================
 def analyze(symbol):
     trend = trend_tf(symbol)
     df = get_data(symbol, TIMEFRAME_ENTRY, 200)
@@ -79,8 +81,13 @@ def analyze(symbol):
     if trend == "UP" and fvg_type == "bull" and price < fvg_high:
         stop = entry - min_stop_dist
         risk = entry - stop
-        takes = [entry + risk*m for m in [3,4,5,6]]
-        rr = risk and (takes[0]-entry)/risk
+
+        takes = [
+            entry + risk*1.5,  # часткова фіксація
+            entry + risk*3,    # основна ціль
+            entry + risk*4.5,  # додаткова
+        ]
+        rr = (takes[-1]-entry)/risk
         if rr < MIN_RR:
             return None
         return build_signal(symbol,"LONG",entry,stop,takes)
@@ -89,8 +96,13 @@ def analyze(symbol):
     if trend == "DOWN" and fvg_type == "bear" and price > fvg_low:
         stop = entry + min_stop_dist
         risk = stop - entry
-        takes = [entry - risk*m for m in [3,4,5,6]]
-        rr = risk and (entry-takes[0])/risk
+
+        takes = [
+            entry - risk*1.5,
+            entry - risk*3,
+            entry - risk*4.5,
+        ]
+        rr = (entry-takes[-1])/risk
         if rr < MIN_RR:
             return None
         return build_signal(symbol,"SHORT",entry,stop,takes)
@@ -99,7 +111,7 @@ def analyze(symbol):
 
 def build_signal(symbol, side, entry, stop, takes):
     clean_symbol = symbol.replace(":USDT","")
-    rr = round(abs((takes[0]-entry)/(entry-stop)),2)
+    rr = round(abs((takes[-1]-entry)/(entry-stop)),2)
 
     entry = round(entry,6)
     stop = round(stop,6)
@@ -141,6 +153,7 @@ async def check_tp_sl(symbol):
             await bot.send_message(CHAT_ID, f"✅ {clean_symbol} Take {i+1} hit!", reply_to_message_id=trade["msg_id"])
             trade["takes"][i] = -999999999
 
+    # STOP LOSS
     if trade["side"]=="LONG" and price <= trade["stop"]:
         await bot.send_message(CHAT_ID, f"❌ {clean_symbol} STOP LOSS!", reply_to_message_id=trade["msg_id"])
         del open_trades[symbol]
