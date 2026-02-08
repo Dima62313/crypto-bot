@@ -12,7 +12,7 @@ CHAT_ID = -1003523855047
 
 SYMBOLS = [
     "BTC/USDT:USDT","ETH/USDT:USDT","SOL/USDT:USDT","BNB/USDT:USDT",
-    "XRP/USDT:USDT","TRX/USDT:USDT","LINK/USDT:USDT","HYPE/USDT:USDT"
+    "XRP/USDT:USDT","TRX/USDT:USDT","LINK/USDT:USDT","DOGE/USDT:USDT"
 ]
 
 TIMEFRAME_TREND = "1h"
@@ -20,8 +20,7 @@ TIMEFRAME_ENTRY = "5m"
 
 CHECK_INTERVAL = 60
 COOLDOWN = 3600
-
-MIN_STOP_PCT = 0.005  # 0.5%
+MIN_STOP_PCT = 0.005   # 0.5%
 # =========================================
 
 bot = Bot(token=TOKEN)
@@ -33,7 +32,7 @@ exchange = ccxt.bybit({
 last_signal_time = {}
 open_trades = {}
 
-# ================= DATA =================
+# ================= UTILS =================
 def get_data(symbol, tf, limit=200):
     ohlcv = exchange.fetch_ohlcv(symbol, tf, limit=limit)
     df = pd.DataFrame(ohlcv, columns=["time","open","high","low","close","volume"])
@@ -53,6 +52,17 @@ def find_fvg(df):
             return ("bear", df["low"].iloc[i-2], df["high"].iloc[i])
     return None
 
+def calc_atr(df, period=14):
+    high = df["high"]
+    low = df["low"]
+    close = df["close"]
+    tr = pd.concat([
+        high - low,
+        (high - close.shift()).abs(),
+        (low - close.shift()).abs()
+    ], axis=1).max(axis=1)
+    return tr.rolling(period).mean().iloc[-1]
+
 # ================= SIGNAL LOGIC =================
 def analyze(symbol):
     trend = trend_tf(symbol)
@@ -62,65 +72,57 @@ def analyze(symbol):
         return None
 
     price = df["close"].iloc[-1]
+    atr = calc_atr(df)
+
     fvg_type, fvg_low, fvg_high = fvg
     entry = (fvg_low + fvg_high) / 2
 
     # ===== LONG =====
-    if trend == "UP" and fvg_type == "bull":
-        stop = entry * (1 - MIN_STOP_PCT)
-        risk = abs(entry - stop)
+    if trend == "UP" and fvg_type == "bull" and price < fvg_high:
+        stop_atr = entry - atr*1.5
+        stop_pct = entry * (1 - MIN_STOP_PCT)
+        stop = min(stop_atr, stop_pct)
 
-        takes = [
-            entry + risk*3,
-            entry + risk*4,
-            entry + risk*5,
-            entry + risk*6
-        ]
-        return build_signal(symbol, "LONG", entry, stop, takes)
+        risk = entry - stop
+        if risk / entry < MIN_STOP_PCT:
+            return None
+
+        takes = [entry + risk*m for m in [3,4,5,6]]
+        return build_signal(symbol,"LONG",entry,stop,takes)
 
     # ===== SHORT =====
-    if trend == "DOWN" and fvg_type == "bear":
-        stop = entry * (1 + MIN_STOP_PCT)
-        risk = abs(stop - entry)
+    if trend == "DOWN" and fvg_type == "bear" and price > fvg_low:
+        stop_atr = entry + atr*1.5
+        stop_pct = entry * (1 + MIN_STOP_PCT)
+        stop = max(stop_atr, stop_pct)
 
-        takes = [
-            entry - risk*3,
-            entry - risk*4,
-            entry - risk*5,
-            entry - risk*6
-        ]
-        return build_signal(symbol, "SHORT", entry, stop, takes)
+        risk = stop - entry
+        if risk / entry < MIN_STOP_PCT:
+            return None
+
+        takes = [entry - risk*m for m in [3,4,5,6]]
+        return build_signal(symbol,"SHORT",entry,stop,takes)
 
     return None
 
-# ================= FORMAT SIGNAL =================
 def build_signal(symbol, side, entry, stop, takes):
-
-    # логічний захист
-    if side == "LONG" and stop >= entry:
-        return None
-    if side == "SHORT" and stop <= entry:
-        return None
-
-    risk = abs(entry - stop)
-    rr = abs((takes[0]-entry)/risk)
-
-    if rr < 3:
+    rr = abs((takes[0]-entry)/(entry-stop))
+    if rr < 2.5:
         return None
 
     entry = round(entry,6)
     stop = round(stop,6)
     takes = [round(t,6) for t in takes]
 
-    sym_clean = symbol.replace(":USDT","")
+    clean_symbol = symbol.replace(":USDT","")
 
-    text = f"""🔊Signal for {sym_clean}
+    text = f"""🔊 Signal for {clean_symbol}
 Type: {"🟩 LONG" if side=="LONG" else "🟥 SHORT"}
-⏰Market: {entry}
+⏰ Market: {entry}
 """
     for i,t in enumerate(takes):
         text += f"🎯{i+1} Take: {t}\n"
-    text += f"🛑Stop: {stop}\nRR: 1:{round(rr,2)}\n"
+    text += f"🛑 Stop: {stop}\nRR: 1:{round(rr,2)}"
 
     return {"text":text, "symbol":symbol, "side":side, "takes":takes, "stop":stop}
 
@@ -142,24 +144,22 @@ async def check_tp_sl(symbol):
     df = get_data(symbol, TIMEFRAME_ENTRY, 5)
     price = df["close"].iloc[-1]
     trade = open_trades[symbol]
-    sym_clean = symbol.replace(":USDT","")
+    clean_symbol = symbol.replace(":USDT","")
 
-    # TAKE PROFIT
     for i,t in enumerate(trade["takes"]):
         if trade["side"]=="LONG" and price >= t:
-            await bot.send_message(CHAT_ID, f"✅ {sym_clean} Take {i+1} hit!", reply_to_message_id=trade["msg_id"])
+            await bot.send_message(CHAT_ID, f"✅ {clean_symbol} Take {i+1} hit!", reply_to_message_id=trade["msg_id"])
             trade["takes"][i] = 999999999
         if trade["side"]=="SHORT" and price <= t:
-            await bot.send_message(CHAT_ID, f"✅ {sym_clean} Take {i+1} hit!", reply_to_message_id=trade["msg_id"])
+            await bot.send_message(CHAT_ID, f"✅ {clean_symbol} Take {i+1} hit!", reply_to_message_id=trade["msg_id"])
             trade["takes"][i] = -999999999
 
-    # STOP LOSS
     if trade["side"]=="LONG" and price <= trade["stop"]:
-        await bot.send_message(CHAT_ID, f"❌ {sym_clean} STOP LOSS!", reply_to_message_id=trade["msg_id"])
+        await bot.send_message(CHAT_ID, f"❌ {clean_symbol} STOP LOSS!", reply_to_message_id=trade["msg_id"])
         del open_trades[symbol]
 
     if trade["side"]=="SHORT" and price >= trade["stop"]:
-        await bot.send_message(CHAT_ID, f"❌ {sym_clean} STOP LOSS!", reply_to_message_id=trade["msg_id"])
+        await bot.send_message(CHAT_ID, f"❌ {clean_symbol} STOP LOSS!", reply_to_message_id=trade["msg_id"])
         del open_trades[symbol]
 
 # ================= MAIN LOOP =================
@@ -187,7 +187,6 @@ async def main():
 
 # ================= FLASK KEEP ALIVE =================
 app = Flask('')
-
 @app.route('/')
 def home():
     return "Bot is running!"
