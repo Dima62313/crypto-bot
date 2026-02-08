@@ -3,25 +3,23 @@ import pandas as pd
 import asyncio
 import time
 from telegram import Bot
+from flask import Flask
+from threading import Thread
 
 # ================= CONFIG =================
-
 TOKEN = "8281155907:AAEtRbRaLO1jA6EZxAGZ74whQdFxEHetxJg"
-CHAT_ID = -1003523855047   # твій канал або група
+CHAT_ID = -1003523855047
 
 SYMBOLS = [
-"BTC/USDT:USDT","ETH/USDT:USDT","SOL/USDT:USDT","BNB/USDT:USDT",
-"XRP/USDT:USDT","TRX/USDT:USDT","LINK/USDT:USDT","HYPE/USDT:USDT"
+    "BTC/USDT:USDT","ETH/USDT:USDT","SOL/USDT:USDT","BNB/USDT:USDT",
+    "XRP/USDT:USDT","TRX/USDT:USDT","LINK/USDT:USDT","HYPE/USDT:USDT"
 ]
 
 TIMEFRAME_TREND = "1h"
 TIMEFRAME_ENTRY = "5m"
 
 CHECK_INTERVAL = 60  # сек
-
-# cooldown по монеті (щоб не спамив)
 COOLDOWN = 3600  # 1 година
-
 # =========================================
 
 bot = Bot(token=TOKEN)
@@ -31,11 +29,9 @@ exchange = ccxt.bybit({
 })
 
 last_signal_time = {}
-open_trades = {}   # symbol -> message_id
-
+open_trades = {}
 
 # ================= UTILS =================
-
 def get_data(symbol, tf, limit=200):
     ohlcv = exchange.fetch_ohlcv(symbol, tf, limit=limit)
     df = pd.DataFrame(ohlcv, columns=["time","open","high","low","close","volume"])
@@ -47,7 +43,6 @@ def trend_tf(symbol):
     ema200 = df["close"].ewm(span=200).mean()
     return "UP" if ema50.iloc[-1] > ema200.iloc[-1] else "DOWN"
 
-# -------- FVG detector (simple SMC) --------
 def find_fvg(df):
     fvg = None
     for i in range(2, len(df)):
@@ -57,13 +52,10 @@ def find_fvg(df):
             fvg = ("bear", df["low"].iloc[i-2], df["high"].iloc[i])
     return fvg
 
-
 # ================= SIGNAL LOGIC =================
-
 def analyze(symbol):
     trend = trend_tf(symbol)
     df = get_data(symbol, TIMEFRAME_ENTRY, 200)
-
     fvg = find_fvg(df)
     if not fvg:
         return None
@@ -74,55 +66,44 @@ def analyze(symbol):
 
     # ===== LONG =====
     if trend == "UP" and fvg_type == "bull" and price < fvg_high:
-        stop = fvg_low
+        stop = entry * 0.995  # мінімум 0.5% від ціни
         risk = entry - stop
-        t1 = entry + risk*2
-        t2 = entry + risk*3
-        t3 = entry + risk*4
-        t4 = entry + risk*5
-        return build_signal(symbol,"LONG",entry,stop,[t1,t2,t3,t4])
+        rr_multiplier = [3,3.5,4,4.5]  # для тейків
+        takes = [entry + risk*m for m in rr_multiplier]
+        return build_signal(symbol,"LONG",entry,stop,takes)
 
     # ===== SHORT =====
     if trend == "DOWN" and fvg_type == "bear" and price > fvg_low:
-        stop = fvg_high
+        stop = entry * 1.005  # мінімум 0.5% від ціни
         risk = stop - entry
-        t1 = entry - risk*2
-        t2 = entry - risk*3
-        t3 = entry - risk*4
-        t4 = entry - risk*5
-        return build_signal(symbol,"SHORT",entry,stop,[t1,t2,t3,t4])
+        rr_multiplier = [3,3.5,4,4.5]
+        takes = [entry - risk*m for m in rr_multiplier]
+        return build_signal(symbol,"SHORT",entry,stop,takes)
 
     return None
 
-
 def build_signal(symbol, side, entry, stop, takes):
-    if stop <= 0 or entry <= 0:
+    if stop <= 0 or entry <= 0 or not takes:
         return None
 
-    rr = abs((takes[0]-entry)/(entry-stop))
-
+    rr = abs((takes[0]-entry)/(entry-stop)) if entry != stop else 0
     if rr < 2:
         return None
 
-    entry = round(entry, 6)
-    stop = round(stop, 6)
+    entry = round(entry,6)
+    stop = round(stop,6)
     takes = [round(t,6) for t in takes]
 
     text = f"""🔊Signal for {symbol.replace(':USDT','')}
 Type: {"🟩 LONG" if side=="LONG" else "🟥 SHORT"}
 ⏰Market: {entry}
-☑️1 Take: {takes[0]}
-☑️2 Take: {takes[1]}
-☑️3 Take: {takes[2]}
-☑️4 Take: {takes[3]}
-🛑Stop: {stop}
-RR: 1:{round(rr,2)}
 """
+    for i,t in enumerate(takes):
+        text += f"🎯{i+1} Take: {t}\n"
+    text += f"🛑Stop: {stop}\nRR: 1:{round(rr,2)}\n"
     return {"text":text, "symbol":symbol, "side":side, "takes":takes, "stop":stop}
 
-
 # ================= TELEGRAM =================
-
 async def send_signal(data):
     msg = await bot.send_message(chat_id=CHAT_ID, text=data["text"])
     open_trades[data["symbol"]] = {
@@ -133,7 +114,6 @@ async def send_signal(data):
     }
     last_signal_time[data["symbol"]] = time.time()
 
-
 async def check_tp_sl(symbol):
     if symbol not in open_trades:
         return
@@ -142,52 +122,49 @@ async def check_tp_sl(symbol):
     price = df["close"].iloc[-1]
     trade = open_trades[symbol]
 
-    # тейки
     for i,t in enumerate(trade["takes"]):
         if trade["side"]=="LONG" and price >= t:
             await bot.send_message(CHAT_ID, f"✅ {symbol} Take {i+1} hit!", reply_to_message_id=trade["msg_id"])
             trade["takes"][i] = 999999999
-
         if trade["side"]=="SHORT" and price <= t:
             await bot.send_message(CHAT_ID, f"✅ {symbol} Take {i+1} hit!", reply_to_message_id=trade["msg_id"])
             trade["takes"][i] = -999999999
 
-    # стоп
     if trade["side"]=="LONG" and price <= trade["stop"]:
         await bot.send_message(CHAT_ID, f"❌ {symbol} STOP LOSS!", reply_to_message_id=trade["msg_id"])
         del open_trades[symbol]
-
     if trade["side"]=="SHORT" and price >= trade["stop"]:
         await bot.send_message(CHAT_ID, f"❌ {symbol} STOP LOSS!", reply_to_message_id=trade["msg_id"])
         del open_trades[symbol]
 
-
 # ================= MAIN LOOP =================
-
 async def main():
     print("✅ Bot started...")
-
     while True:
         for sym in SYMBOLS:
             try:
-                # cooldown
                 if sym in last_signal_time and time.time()-last_signal_time[sym] < COOLDOWN:
                     await check_tp_sl(sym)
                     continue
-
                 if sym in open_trades:
                     await check_tp_sl(sym)
                     continue
-
                 data = analyze(sym)
                 if data:
                     await send_signal(data)
-
             except Exception as e:
                 print("ERROR", sym, e)
-
         await asyncio.sleep(CHECK_INTERVAL)
 
+# ================= FLASK =================
+app = Flask('')
+@app.route('/')
+def home():
+    return "Bot is running!"
+
+def run():
+    app.run(host='0.0.0.0', port=8080)
+Thread(target=run).start()
 
 if __name__ == "__main__":
     asyncio.run(main())
