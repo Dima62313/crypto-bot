@@ -21,14 +21,11 @@ TIMEFRAME_ENTRY = "5m"
 CHECK_INTERVAL = 60
 COOLDOWN = 3600
 MIN_STOP_PCT = 0.005   # 0.5%
+MIN_RR = 2.5
 # =========================================
 
 bot = Bot(token=TOKEN)
-
-exchange = ccxt.bybit({
-    "options": {"defaultType": "future"}
-})
-
+exchange = ccxt.bybit({"options": {"defaultType": "future"}})
 last_signal_time = {}
 open_trades = {}
 
@@ -73,48 +70,40 @@ def analyze(symbol):
 
     price = df["close"].iloc[-1]
     atr = calc_atr(df)
-
     fvg_type, fvg_low, fvg_high = fvg
     entry = (fvg_low + fvg_high) / 2
 
+    min_stop_dist = max(entry * MIN_STOP_PCT, atr*2)
+
     # ===== LONG =====
     if trend == "UP" and fvg_type == "bull" and price < fvg_high:
-        stop_atr = entry - atr*1.5
-        stop_pct = entry * (1 - MIN_STOP_PCT)
-        stop = min(stop_atr, stop_pct)
-
+        stop = entry - min_stop_dist
         risk = entry - stop
-        if risk / entry < MIN_STOP_PCT:
-            return None
-
         takes = [entry + risk*m for m in [3,4,5,6]]
+        rr = risk and (takes[0]-entry)/risk
+        if rr < MIN_RR:
+            return None
         return build_signal(symbol,"LONG",entry,stop,takes)
 
     # ===== SHORT =====
     if trend == "DOWN" and fvg_type == "bear" and price > fvg_low:
-        stop_atr = entry + atr*1.5
-        stop_pct = entry * (1 + MIN_STOP_PCT)
-        stop = max(stop_atr, stop_pct)
-
+        stop = entry + min_stop_dist
         risk = stop - entry
-        if risk / entry < MIN_STOP_PCT:
-            return None
-
         takes = [entry - risk*m for m in [3,4,5,6]]
+        rr = risk and (entry-takes[0])/risk
+        if rr < MIN_RR:
+            return None
         return build_signal(symbol,"SHORT",entry,stop,takes)
 
     return None
 
 def build_signal(symbol, side, entry, stop, takes):
-    rr = abs((takes[0]-entry)/(entry-stop))
-    if rr < 2.5:
-        return None
+    clean_symbol = symbol.replace(":USDT","")
+    rr = round(abs((takes[0]-entry)/(entry-stop)),2)
 
     entry = round(entry,6)
     stop = round(stop,6)
     takes = [round(t,6) for t in takes]
-
-    clean_symbol = symbol.replace(":USDT","")
 
     text = f"""🔊 Signal for {clean_symbol}
 Type: {"🟩 LONG" if side=="LONG" else "🟥 SHORT"}
@@ -122,8 +111,7 @@ Type: {"🟩 LONG" if side=="LONG" else "🟥 SHORT"}
 """
     for i,t in enumerate(takes):
         text += f"🎯{i+1} Take: {t}\n"
-    text += f"🛑 Stop: {stop}\nRR: 1:{round(rr,2)}"
-
+    text += f"🛑 Stop: {stop}\nRR: 1:{rr}"
     return {"text":text, "symbol":symbol, "side":side, "takes":takes, "stop":stop}
 
 # ================= TELEGRAM =================
@@ -140,7 +128,6 @@ async def send_signal(data):
 async def check_tp_sl(symbol):
     if symbol not in open_trades:
         return
-
     df = get_data(symbol, TIMEFRAME_ENTRY, 5)
     price = df["close"].iloc[-1]
     trade = open_trades[symbol]
@@ -157,7 +144,6 @@ async def check_tp_sl(symbol):
     if trade["side"]=="LONG" and price <= trade["stop"]:
         await bot.send_message(CHAT_ID, f"❌ {clean_symbol} STOP LOSS!", reply_to_message_id=trade["msg_id"])
         del open_trades[symbol]
-
     if trade["side"]=="SHORT" and price >= trade["stop"]:
         await bot.send_message(CHAT_ID, f"❌ {clean_symbol} STOP LOSS!", reply_to_message_id=trade["msg_id"])
         del open_trades[symbol]
@@ -171,18 +157,14 @@ async def main():
                 if sym in last_signal_time and time.time()-last_signal_time[sym] < COOLDOWN:
                     await check_tp_sl(sym)
                     continue
-
                 if sym in open_trades:
                     await check_tp_sl(sym)
                     continue
-
                 data = analyze(sym)
                 if data:
                     await send_signal(data)
-
             except Exception as e:
                 print("ERROR", sym, e)
-
         await asyncio.sleep(CHECK_INTERVAL)
 
 # ================= FLASK KEEP ALIVE =================
