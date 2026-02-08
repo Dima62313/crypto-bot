@@ -18,8 +18,10 @@ SYMBOLS = [
 TIMEFRAME_TREND = "1h"
 TIMEFRAME_ENTRY = "5m"
 
-CHECK_INTERVAL = 60  # сек
-COOLDOWN = 3600  # 1 година
+CHECK_INTERVAL = 60
+COOLDOWN = 3600
+
+MIN_STOP_PCT = 0.005  # 0.5%
 # =========================================
 
 bot = Bot(token=TOKEN)
@@ -31,7 +33,7 @@ exchange = ccxt.bybit({
 last_signal_time = {}
 open_trades = {}
 
-# ================= UTILS =================
+# ================= DATA =================
 def get_data(symbol, tf, limit=200):
     ohlcv = exchange.fetch_ohlcv(symbol, tf, limit=limit)
     df = pd.DataFrame(ohlcv, columns=["time","open","high","low","close","volume"])
@@ -44,13 +46,12 @@ def trend_tf(symbol):
     return "UP" if ema50.iloc[-1] > ema200.iloc[-1] else "DOWN"
 
 def find_fvg(df):
-    fvg = None
     for i in range(2, len(df)):
         if df["low"].iloc[i] > df["high"].iloc[i-2]:
-            fvg = ("bull", df["high"].iloc[i-2], df["low"].iloc[i])
+            return ("bull", df["high"].iloc[i-2], df["low"].iloc[i])
         if df["high"].iloc[i] < df["low"].iloc[i-2]:
-            fvg = ("bear", df["low"].iloc[i-2], df["high"].iloc[i])
-    return fvg
+            return ("bear", df["low"].iloc[i-2], df["high"].iloc[i])
+    return None
 
 # ================= SIGNAL LOGIC =================
 def analyze(symbol):
@@ -65,42 +66,62 @@ def analyze(symbol):
     entry = (fvg_low + fvg_high) / 2
 
     # ===== LONG =====
-    if trend == "UP" and fvg_type == "bull" and price < fvg_high:
-        stop = entry * 0.995  # мінімум 0.5% від ціни
-        risk = entry - stop
-        rr_multiplier = [3,3.5,4,4.5]  # для тейків
-        takes = [entry + risk*m for m in rr_multiplier]
-        return build_signal(symbol,"LONG",entry,stop,takes)
+    if trend == "UP" and fvg_type == "bull":
+        stop = entry * (1 - MIN_STOP_PCT)
+        risk = abs(entry - stop)
+
+        takes = [
+            entry + risk*3,
+            entry + risk*4,
+            entry + risk*5,
+            entry + risk*6
+        ]
+        return build_signal(symbol, "LONG", entry, stop, takes)
 
     # ===== SHORT =====
-    if trend == "DOWN" and fvg_type == "bear" and price > fvg_low:
-        stop = entry * 1.005  # мінімум 0.5% від ціни
-        risk = stop - entry
-        rr_multiplier = [3,3.5,4,4.5]
-        takes = [entry - risk*m for m in rr_multiplier]
-        return build_signal(symbol,"SHORT",entry,stop,takes)
+    if trend == "DOWN" and fvg_type == "bear":
+        stop = entry * (1 + MIN_STOP_PCT)
+        risk = abs(stop - entry)
+
+        takes = [
+            entry - risk*3,
+            entry - risk*4,
+            entry - risk*5,
+            entry - risk*6
+        ]
+        return build_signal(symbol, "SHORT", entry, stop, takes)
 
     return None
 
+# ================= FORMAT SIGNAL =================
 def build_signal(symbol, side, entry, stop, takes):
-    if stop <= 0 or entry <= 0 or not takes:
+
+    # логічний захист
+    if side == "LONG" and stop >= entry:
+        return None
+    if side == "SHORT" and stop <= entry:
         return None
 
-    rr = abs((takes[0]-entry)/(entry-stop)) if entry != stop else 0
-    if rr < 2:
+    risk = abs(entry - stop)
+    rr = abs((takes[0]-entry)/risk)
+
+    if rr < 3:
         return None
 
     entry = round(entry,6)
     stop = round(stop,6)
     takes = [round(t,6) for t in takes]
 
-    text = f"""🔊Signal for {symbol.replace(':USDT','')}
+    sym_clean = symbol.replace(":USDT","")
+
+    text = f"""🔊Signal for {sym_clean}
 Type: {"🟩 LONG" if side=="LONG" else "🟥 SHORT"}
 ⏰Market: {entry}
 """
     for i,t in enumerate(takes):
         text += f"🎯{i+1} Take: {t}\n"
     text += f"🛑Stop: {stop}\nRR: 1:{round(rr,2)}\n"
+
     return {"text":text, "symbol":symbol, "side":side, "takes":takes, "stop":stop}
 
 # ================= TELEGRAM =================
@@ -121,20 +142,24 @@ async def check_tp_sl(symbol):
     df = get_data(symbol, TIMEFRAME_ENTRY, 5)
     price = df["close"].iloc[-1]
     trade = open_trades[symbol]
+    sym_clean = symbol.replace(":USDT","")
 
+    # TAKE PROFIT
     for i,t in enumerate(trade["takes"]):
         if trade["side"]=="LONG" and price >= t:
-            await bot.send_message(CHAT_ID, f"✅ {symbol} Take {i+1} hit!", reply_to_message_id=trade["msg_id"])
+            await bot.send_message(CHAT_ID, f"✅ {sym_clean} Take {i+1} hit!", reply_to_message_id=trade["msg_id"])
             trade["takes"][i] = 999999999
         if trade["side"]=="SHORT" and price <= t:
-            await bot.send_message(CHAT_ID, f"✅ {symbol} Take {i+1} hit!", reply_to_message_id=trade["msg_id"])
+            await bot.send_message(CHAT_ID, f"✅ {sym_clean} Take {i+1} hit!", reply_to_message_id=trade["msg_id"])
             trade["takes"][i] = -999999999
 
+    # STOP LOSS
     if trade["side"]=="LONG" and price <= trade["stop"]:
-        await bot.send_message(CHAT_ID, f"❌ {symbol} STOP LOSS!", reply_to_message_id=trade["msg_id"])
+        await bot.send_message(CHAT_ID, f"❌ {sym_clean} STOP LOSS!", reply_to_message_id=trade["msg_id"])
         del open_trades[symbol]
+
     if trade["side"]=="SHORT" and price >= trade["stop"]:
-        await bot.send_message(CHAT_ID, f"❌ {symbol} STOP LOSS!", reply_to_message_id=trade["msg_id"])
+        await bot.send_message(CHAT_ID, f"❌ {sym_clean} STOP LOSS!", reply_to_message_id=trade["msg_id"])
         del open_trades[symbol]
 
 # ================= MAIN LOOP =================
@@ -146,24 +171,30 @@ async def main():
                 if sym in last_signal_time and time.time()-last_signal_time[sym] < COOLDOWN:
                     await check_tp_sl(sym)
                     continue
+
                 if sym in open_trades:
                     await check_tp_sl(sym)
                     continue
+
                 data = analyze(sym)
                 if data:
                     await send_signal(data)
+
             except Exception as e:
                 print("ERROR", sym, e)
+
         await asyncio.sleep(CHECK_INTERVAL)
 
-# ================= FLASK =================
+# ================= FLASK KEEP ALIVE =================
 app = Flask('')
+
 @app.route('/')
 def home():
     return "Bot is running!"
 
 def run():
     app.run(host='0.0.0.0', port=8080)
+
 Thread(target=run).start()
 
 if __name__ == "__main__":
